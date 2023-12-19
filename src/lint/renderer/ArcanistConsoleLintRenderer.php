@@ -1,17 +1,10 @@
 <?php
 
-/**
- * Shows lint messages to the user.
- */
 final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
 
-  private $showAutofixPatches = false;
-  private $testableMode;
+  const RENDERERKEY = 'console';
 
-  public function setShowAutofixPatches($show_autofix_patches) {
-    $this->showAutofixPatches = $show_autofix_patches;
-    return $this;
-  }
+  private $testableMode;
 
   public function setTestableMode($testable_mode) {
     $this->testableMode = $testable_mode;
@@ -20,6 +13,38 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
 
   public function getTestableMode() {
     return $this->testableMode;
+  }
+
+  public function supportsPatching() {
+    return true;
+  }
+
+  public function renderResultCode($result_code) {
+    if ($result_code == ArcanistLintWorkflow::RESULT_OKAY) {
+      $view = new PhutilConsoleInfo(
+        pht('OKAY'),
+        pht('No lint messages.'));
+      $this->writeOut($view->drawConsoleString());
+    }
+  }
+
+  public function promptForPatch(
+    ArcanistLintResult $result,
+    $old_path,
+    $new_path) {
+
+    if ($old_path === null) {
+      $old_path = '/dev/null';
+    }
+
+    list($err, $stdout) = exec_manual('diff -u %s %s', $old_path, $new_path);
+    $this->writeOut($stdout);
+
+    $prompt = pht(
+      'Apply this patch to %s?',
+      tsprintf('__%s__', $result->getPath()));
+
+    return phutil_console_confirm($prompt, $default_no = false);
   }
 
   public function renderLintResult(ArcanistLintResult $result) {
@@ -31,10 +56,6 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
 
     $text = array();
     foreach ($messages as $message) {
-      if (!$this->showAutofixPatches && $message->isAutofix()) {
-        continue;
-      }
-
       if ($message->isError()) {
         $color = 'red';
       } else {
@@ -77,9 +98,7 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
         pht(
           'Lint for %s:',
           phutil_console_format('__%s__', $path)));
-      return $prefix.implode("\n", $text);
-    } else {
-      return null;
+      $this->writeOut($prefix.implode("\n", $text));
     }
   }
 
@@ -93,6 +112,8 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
     $message = $message->newTrimmedMessage();
 
     $original = $message->getOriginalText();
+    $original = phutil_string_cast($original);
+
     $replacement = $message->getReplacementText();
 
     $line = $message->getLine();
@@ -102,6 +123,41 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
     $old_lines = phutil_split_lines($old);
     $old_impact = substr_count($original, "\n") + 1;
     $start = $line;
+
+    // See PHI1782. If a linter raises a message at a line that does not
+    // exist, just render a warning message.
+
+    // Linters are permitted to raise a warning at the very end of a file.
+    // For example, if a file is 13 lines long, it is valid to raise a message
+    // on line 14 as long as the character position is 1 or unspecified and
+    // there is no "original" text.
+
+    $max_old = count($old_lines);
+
+    $invalid_position = false;
+    if ($start > ($max_old + 1)) {
+      $invalid_position = true;
+    } else if ($start > $max_old) {
+      if (strlen($original)) {
+        $invalid_position = true;
+      } else if ($char !== null && $char !== 1) {
+        $invalid_position = true;
+      }
+    }
+
+    if ($invalid_position) {
+      $warning = $this->renderLine(
+        $start,
+        pht(
+          '(This message was raised at line %s, but the file only has '.
+          '%s line(s).)',
+          new PhutilNumber($start),
+          new PhutilNumber($max_old)),
+        false,
+        '?');
+
+      return $warning."\n\n";
+    }
 
     if ($message->isPatchable()) {
       $patch_offset = $line_map[$line] + ($char - 1);
@@ -127,11 +183,16 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
           $char - 1,
           strlen($original));
 
-        $new_lines[$start - 1] = substr_replace(
-          $new_lines[$start - 1],
-          $this->highlightText($replacement),
-          $char - 1,
-          strlen($replacement));
+        // See T13543. The message may have completely removed this line: for
+        // example, if it trimmed trailing spaces from the end of a file. If
+        // the line no longer exists, don't try to highlight it.
+        if (isset($new_lines[$start - 1])) {
+          $new_lines[$start - 1] = substr_replace(
+            $new_lines[$start - 1],
+            $this->highlightText($replacement),
+            $char - 1,
+            strlen($replacement));
+        }
       }
 
       // If lines at the beginning of the changed line range are actually the
@@ -148,36 +209,35 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
         $old_impact--;
         $new_impact--;
 
-        if ($old_impact < 0 || $new_impact < 0) {
-          throw new Exception(
-            pht(
-              'Modified prefix line range has become negative '.
-              '(old = %d, new = %d).',
-              $old_impact,
-              $new_impact));
+        // We can end up here if a patch removes a line which occurs before
+        // another identical line.
+        if ($old_impact <= 0 || $new_impact <= 0) {
+          break;
         }
       } while (true);
 
       // If the lines at the end of the changed line range are actually the
       // same, shrink the range. This happens when a patch just removes a
       // line.
-      do {
-        $old_suffix = idx($old_lines, $start + $old_impact - 2, null);
-        $new_suffix = idx($new_lines, $start + $new_impact - 2, null);
+      if ($old_impact > 0 && $new_impact > 0) {
+        do {
+          $old_suffix = idx($old_lines, $start + $old_impact - 2, null);
+          $new_suffix = idx($new_lines, $start + $new_impact - 2, null);
 
-        if ($old_suffix !== $new_suffix) {
-          break;
-        }
+          if ($old_suffix !== $new_suffix) {
+            break;
+          }
 
-        $old_impact--;
-        $new_impact--;
+          $old_impact--;
+          $new_impact--;
 
-        // We can end up here if a patch removes a line which occurs after
-        // another identical line.
-        if ($old_impact <= 0 || $new_impact <= 0) {
-          break;
-        }
-      } while (true);
+          // We can end up here if a patch removes a line which occurs after
+          // another identical line.
+          if ($old_impact <= 0 || $new_impact <= 0) {
+            break;
+          }
+        } while (true);
+      }
 
     } else {
 
@@ -216,8 +276,11 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
     }
 
     for ($ii = $start; $ii < $start + $new_impact; $ii++) {
+      // If the patch was at the end of the file and ends with a newline, we
+      // won't have an actual entry in the array for the last line, even though
+      // we want to show it in the diff.
       $out[] = array(
-        'text' => $new_lines[$ii - 1],
+        'text' => idx($new_lines, $ii - 1, ''),
         'type' => '+',
         'chevron' => ($ii == $start),
       );
@@ -246,9 +309,17 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
         }
       }
 
+      // If the line doesn't actually end in a newline, add one so the layout
+      // doesn't mess up. This can happen when the last line of the old file
+      // didn't have a newline at the end.
+      $text = $spec['text'];
+      if (!preg_match('/\n\z/', $spec['text'])) {
+        $text .= "\n";
+      }
+
       $result[] = $this->renderLine(
         idx($spec, 'number'),
-        $spec['text'],
+        $text,
         $chevron,
         idx($spec, 'type'));
 
@@ -278,13 +349,6 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
       $data);
   }
 
-  public function renderOkayResult() {
-    return phutil_console_format(
-      "<bg:green>** %s **</bg> %s\n",
-      pht('OKAY'),
-      pht('No lint warnings.'));
-  }
-
   private function newOffsetMap($data) {
     $lines = phutil_split_lines($data);
 
@@ -296,6 +360,15 @@ final class ArcanistConsoleLintRenderer extends ArcanistLintRenderer {
       $line_map[$number] = $offset;
       $number++;
       $offset += strlen($line);
+    }
+
+    // If the last line ends in a newline, add a virtual offset for the final
+    // line with no characters on it. This allows lint messages to target the
+    // last line of the file at character 1.
+    if ($lines) {
+      if (preg_match('/\n\z/', $line)) {
+        $line_map[$number] = $offset;
+      }
     }
 
     return $line_map;

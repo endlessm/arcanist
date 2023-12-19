@@ -115,66 +115,59 @@ EOTEXT
   }
 
   protected function didParseArguments() {
-    $source = null;
-    $requested = 0;
-    if ($this->getArgument('revision')) {
-      $source = self::SOURCE_REVISION;
-      $requested++;
-    }
-    if ($this->getArgument('diff')) {
-      $source = self::SOURCE_DIFF;
-      $requested++;
-    }
-    if ($this->getArgument('arcbundle')) {
-      $source = self::SOURCE_BUNDLE;
-      $requested++;
-    }
-    if ($this->getArgument('patch')) {
-      $source = self::SOURCE_PATCH;
-      $requested++;
-    }
+    $arguments = array(
+      'revision' => self::SOURCE_REVISION,
+      'diff' => self::SOURCE_DIFF,
+      'arcbundle' => self::SOURCE_BUNDLE,
+      'patch' => self::SOURCE_PATCH,
+      'name' => self::SOURCE_REVISION,
+    );
 
-    $use_revision_id = null;
-    if ($this->getArgument('name')) {
-      $namev = $this->getArgument('name');
-      if (count($namev) > 1) {
-        throw new ArcanistUsageException(
-          pht('Specify at most one revision name.'));
+    $sources = array();
+    foreach ($arguments as $key => $source_type) {
+      $value = $this->getArgument($key);
+      if (!$value) {
+        continue;
       }
-      $source = self::SOURCE_REVISION;
-      $requested++;
 
-      $use_revision_id = $this->normalizeRevisionID(head($namev));
+      switch ($key) {
+        case 'revision':
+          $value = $this->normalizeRevisionID($value);
+          break;
+        case 'name':
+          if (count($value) > 1) {
+            throw new ArcanistUsageException(
+              pht('Specify at most one revision name.'));
+          }
+          $value = $this->normalizeRevisionID(head($value));
+          break;
+      }
+
+      $sources[] = array(
+        $source_type,
+        $value,
+      );
     }
 
-    if ($requested === 0) {
+    if (!$sources) {
       throw new ArcanistUsageException(
         pht(
-          "Specify one of '%s', '%s' (to select the current changes attached ".
-          "to a Differential revision), '%s' (to select a specific, ".
-          "out-of-date diff or a diff which is not attached to a revision), ".
-          "'%s' or '%s' to choose a patch source.",
-          'D12345',
-          '--revision <revision_id>',
-          '--diff <diff_id>',
-          '--arcbundle <file>',
-          '--patch <file>'));
-    } else if ($requested > 1) {
-      throw new ArcanistUsageException(
-        pht(
-          "Options '%s', '%s', '%s', '%s' and '%s' are not compatible. ".
-          "Choose exactly one patch source.",
-          'D12345',
-          '--revision',
-          '--diff',
-          '--arcbundle',
-          '--patch'));
+          'You must specify changes to apply to the working copy with '.
+          '"D12345", "--revision", "--diff", "--arcbundle", or "--patch".'));
     }
 
-    $this->source = $source;
-    $this->sourceParam = nonempty(
-      $use_revision_id,
-      $this->getArgument($source));
+    if (count($sources) > 1) {
+      throw new ArcanistUsageException(
+        pht(
+          'Options "D12345", "--revision", "--diff", "--arcbundle" and '.
+          '"--patch" are mutually exclusive. Choose exactly one patch '.
+          'source.'));
+    }
+
+    $source = head($sources);
+
+    $this->source = $source[0];
+    $this->sourceParam = $source[1];
   }
 
   public function requiresConduit() {
@@ -313,6 +306,14 @@ EOTEXT
       } else {
         $repository_api->execxLocal('checkout -b %s', $branch_name);
       }
+
+      // Synchronize submodule state, since the checkout may have modified
+      // submodule references. See PHI1083.
+
+      // Note that newer versions of "git checkout" include a
+      // "--recurse-submodules" flag which accomplishes this goal a little
+      // more simply. For now, use the more compatible form.
+      $repository_api->execPassthru('submodule update --init --recursive');
 
       echo phutil_console_format(
         "%s\n",
@@ -706,7 +707,7 @@ EOTEXT
         'git apply --whitespace nowarn --index --reject -- %s',
         $patchfile);
       $passthru->setCWD($repository_api->getPath());
-      $err = $passthru->execute();
+      $err = $passthru->resolve();
 
       if ($err) {
         echo phutil_console_format(
@@ -721,38 +722,67 @@ EOTEXT
         throw new ArcanistUsageException(pht('Unable to apply patch!'));
       }
 
-      // in case there were any submodule changes involved
+      // See PHI1083 and PHI648. If the patch applied changes to submodules,
+      // it only updates the submodule pointer, not the actual submodule. We're
+      // left with the pointer update staged in the index, and the unmodified
+      // submodule on disk.
+
+      // If we then "git commit --all" or "git add --all", the unmodified
+      // submodule on disk is added to the index as a change, which effectively
+      // undoes the patch we just applied and reverts the submodule back to
+      // the previous state.
+
+      // To avoid this, do a submodule update before we continue.
+
+      // We could also possibly skip the "--all" flag so we don't have to do
+      // this submodule update, but we want to leave the working copy in a
+      // clean state anyway, so we're going to have to do an update at some
+      // point. This usually doesn't cost us anything.
       $repository_api->execPassthru('submodule update --init --recursive');
 
       if ($this->shouldCommit()) {
+        $flags = array();
         if ($bundle->getFullAuthor()) {
-          $author_cmd = csprintf('--author=%s', $bundle->getFullAuthor());
-        } else {
-          $author_cmd = '';
+          $flags[] = csprintf('--author=%s', $bundle->getFullAuthor());
         }
 
         $commit_message = $this->getCommitMessage($bundle);
+
         $future = $repository_api->execFutureLocal(
-          'commit -a %C -F - --no-verify',
-          $author_cmd);
+          'commit -a %Ls -F - --no-verify',
+          $flags);
         $future->write($commit_message);
         $future->resolvex();
-        $verb = pht('committed');
+
+        $this->writeOkay(
+          pht('COMMITTED'),
+          pht('Successfully committed patch.'));
       } else {
-        $verb = pht('applied');
+        $this->writeOkay(
+          pht('APPLIED'),
+          pht('Successfully applied patch.'));
       }
 
       if ($this->canBranch() &&
           !$this->shouldBranch() &&
           $this->shouldCommit() && $has_base_revision) {
-        $repository_api->execxLocal('checkout %s', $original_branch);
+
+        // See PHI1083 and PHI648. Synchronize submodule state after mutating
+        // the working copy.
+
+        $repository_api->execxLocal('checkout %s --', $original_branch);
+        $repository_api->execPassthru('submodule update --init --recursive');
+
         $ex = null;
         try {
-          $repository_api->execxLocal('cherry-pick %s', $new_branch);
+          $repository_api->execxLocal('cherry-pick -- %s', $new_branch);
+          $repository_api->execPassthru('submodule update --init --recursive');
         } catch (Exception $ex) {
           // do nothing
         }
-        $repository_api->execxLocal('branch -D %s', $new_branch);
+
+        $repository_api->execxLocal('branch -D -- %s', $new_branch);
+
         if ($ex) {
           echo phutil_console_format(
             "\n<bg:red>** %s**</bg>\n",
@@ -761,10 +791,6 @@ EOTEXT
         }
       }
 
-      echo phutil_console_format(
-        "<bg:green>** %s **</bg> %s\n",
-        pht('OKAY'),
-        pht('Successfully %s patch.', $verb));
     } else if ($repository_api instanceof ArcanistMercurialAPI) {
       $future = $repository_api->execFutureLocal('import --no-commit -');
       $future->write($bundle->toGitPatch());
@@ -864,8 +890,8 @@ EOTEXT
           'revision_id' => $revision_id,
         ));
       $prompt_message = pht(
-        '  Note arcanist failed to load the commit message '.
-        'from differential for revision %s.',
+        '  NOTE: Failed to load the commit message from Differential (for '.
+        'revision "%s".)',
         "D{$revision_id}");
     }
 
@@ -883,6 +909,8 @@ EOTEXT
 
       $commit_message = $this->newInteractiveEditor($template)
         ->setName('arcanist-patch-commit-message')
+        ->setTaskMessage(pht(
+          'Supply a commit message for this patch, then save and exit.'))
         ->editInteractively();
 
       $commit_message = ArcanistCommentRemover::removeComments($commit_message);
@@ -913,7 +941,7 @@ EOTEXT
           'is not guaranteed to work. Continue anyway?');
         $okay = phutil_console_confirm($issue, true);
       } else {
-        $phids = $graph->getTopographicallySortedNodes();
+        $phids = $graph->getNodesInTopologicalOrder();
         $phids = array_reverse($phids);
         $okay = true;
       }

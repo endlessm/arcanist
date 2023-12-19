@@ -120,6 +120,42 @@ EOTEXT;
         'original' => "\n",
         'replacement' => '',
       ),
+
+      'eofnewline' => array(
+        'line' => 1,
+        'char' => 7,
+        'original' => '',
+        'replacement' => "\n",
+      ),
+
+      'eofmultilinechar' => array(
+        'line' => 5,
+        'char' => 3,
+        'original' => '',
+        'replacement' => "\nX\nY\n",
+      ),
+
+      'eofmultilineline' => array(
+        'line' => 6,
+        'char' => 1,
+        'original' => '',
+        'replacement' => "\nX\nY\n",
+      ),
+
+      'rmmulti' => array(
+        'line' => 2,
+        'char' => 1,
+        'original' => "\n",
+        'replacement' => '',
+      ),
+
+      'rmmulti2' => array(
+        'line' => 1,
+        'char' => 2,
+        'original' => "\n",
+        'replacement' => '',
+      ),
+
     );
 
     $defaults = array(
@@ -132,8 +168,6 @@ EOTEXT;
 
     foreach ($map as $key => $test_case) {
       $data = $this->readTestData("{$key}.txt");
-      $data = preg_replace('/~+\s*$/m', '', $data);
-
       $expect = $this->readTestData("{$key}.expect");
 
       $test_case = $test_case + $defaults;
@@ -171,17 +205,18 @@ EOTEXT;
 
       try {
         PhutilConsoleFormatter::disableANSI(true);
-        $actual = $renderer->renderLintResult($result);
+
+        $tmp = new TempFile();
+        $renderer->setOutputPath($tmp);
+        $renderer->renderLintResult($result);
+        $actual = Filesystem::readFile($tmp);
+        unset($tmp);
+
         PhutilConsoleFormatter::disableANSI(false);
       } catch (Exception $ex) {
         PhutilConsoleFormatter::disableANSI(false);
         throw $ex;
       }
-
-      // Trim "~" off the ends of lines. This allows the "expect" file to test
-      // for trailing whitespace without actually containing trailing
-      // whitespace.
-      $expect = preg_replace('/~+$/m', '', $expect);
 
       $this->assertEqual(
         $expect,
@@ -194,7 +229,19 @@ EOTEXT;
 
   private function readTestData($filename) {
     $path = dirname(__FILE__).'/data/'.$filename;
-    return Filesystem::readFile($path);
+    $data = Filesystem::readFile($path);
+
+    // If we find "~~~" at the end of the file, get rid of it and any whitespace
+    // afterwards. This allows specifying data files with trailing empty
+    // lines.
+    $data = preg_replace('/~~~\s*\z/', '', $data);
+
+    // Trim "~" off the ends of lines. This allows the "expect" file to test
+    // for trailing whitespace without actually containing trailing
+    // whitespace.
+    $data = preg_replace('/~$/m', '', $data);
+
+    return $data;
   }
 
 }
