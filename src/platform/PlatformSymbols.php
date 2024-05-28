@@ -8,7 +8,15 @@ final class PlatformSymbols
   }
 
   public static function getPlatformServerName() {
-    return 'Phabricator';
+    return 'Phorge';
+  }
+
+  public static function getPlatformClientPath() {
+    return 'arcanist/';
+  }
+
+  public static function getPlatformServerPath() {
+    return 'phorge/';
   }
 
   public static function getProductNames() {
