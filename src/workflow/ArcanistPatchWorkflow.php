@@ -391,7 +391,8 @@ EOTEXT
           break;
       }
     } catch (ConduitClientException $ex) {
-      if ($ex->getErrorCode() == 'ERR-INVALID-SESSION') {
+      if ($ex->getErrorCode() == 'ERR-INVALID-SESSION' ||
+           $ex->getErrorCode() == 'ERR-INVALID-AUTH') {
         // Phabricator is not configured to allow anonymous access to
         // Differential.
         $this->authenticateConduit();
@@ -743,7 +744,7 @@ EOTEXT
       if ($this->shouldCommit()) {
         $flags = array();
         if ($bundle->getFullAuthor()) {
-          $flags[] = csprintf('--author=%s', $bundle->getFullAuthor());
+          $flags[] = sprintf('--author=%s', $bundle->getFullAuthor());
         }
 
         $commit_message = $this->getCommitMessage($bundle);
